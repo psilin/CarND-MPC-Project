@@ -101,6 +101,10 @@ int main() {
           double psi = j[1]["psi"];
           double v = j[1]["speed"];
 
+          //get throttle and steering angle as well
+          double delta = j[1]["steering_angle"];
+          double a = j[1]["throttle"];
+
           //transform ptsx & y to car coordinate system
           Eigen::VectorXd x_inp(ptsx.size());
           Eigen::VectorXd y_inp(ptsy.size());
@@ -114,11 +118,20 @@ int main() {
 
           //fitting poly of 3rd degree
           auto coeffs = polyfit(x_inp, y_inp, 3);
-          double cte = polyeval(coeffs, 0.) - 0.;
-          double epsi = 0. - atan(polyeval_der(coeffs, 0.));
+          double cte = coeffs[0.];
+          double epsi = -atan(coeffs[1]);
+
+          //after delay (NOTE: in vehicle coordinates)
+          double dt = 0.1;
+          double x1 = 0. + v * cos(0) * dt;
+          double y1 = 0.;
+          double psi1 = 0. - v * delta * dt / mpc.lf();
+          double v1 = v + a * dt;
+          double cte1 = cte + v * sin(epsi) * dt;
+          double epsi1 = epsi - v * atan(coeffs[1]) * dt / mpc.lf();
 
           Eigen::VectorXd state(6);
-          state << 0., 0., 0., v, cte, epsi;
+          state << x1, y1, psi1, v1, cte1, epsi1;
 
           vector<double> result = mpc.Solve(state, coeffs);
 
@@ -157,9 +170,9 @@ int main() {
           vector<double> next_y_vals;
 
           //display fitting polynome segments
-          for (int i = 1; i < 25; i++) {
-            next_x_vals.emplace_back(i);
-            next_y_vals.emplace_back(polyeval(coeffs, i));
+          for (int i = 1; i < 10; i++) {
+            next_x_vals.emplace_back(5*i);
+            next_y_vals.emplace_back(polyeval(coeffs, 5*i));
           }
 
           //.. add (x,y) points to list here, points are in reference to the vehicle's coordinate system
@@ -179,7 +192,7 @@ int main() {
           //
           // NOTE: REMEMBER TO SET THIS TO 100 MILLISECONDS BEFORE
           // SUBMITTING.
-          //FIX ME!!!//this_thread::sleep_for(chrono::milliseconds(100));
+          this_thread::sleep_for(chrono::milliseconds(100));
           ws.send(msg.data(), msg.length(), uWS::OpCode::TEXT);
         }
       } else {
