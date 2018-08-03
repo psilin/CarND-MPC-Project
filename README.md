@@ -3,6 +3,139 @@ Self-Driving Car Engineer Nanodegree Program
 
 ---
 
+## Overview
+
+Project is dedicated to using Model Predictive Controller to allow car autonomously steer in Udacity's simulator. At each
+epoch telemtry information is obtained from simulator. It consists of car state (in map coordinate system), control values
+(throttle and steering angle) and a number of trajectory points. Model Predictive Controller sends back actual control
+values to simulator. There is a delay of `100` ms between computing actual control values and sending it back to simulator 
+to further complicate the task. Implementation of a Model Predictive Controller is discussed in the following section. Video
+of car running a lap controlled by this implementation is available [here](https://youtu.be/GFi-d95nyCc).
+
+## Implementation
+
+Implemenation will be described in order of computational flow, step by step.
+
+### 1. Data preparation.
+
+First of all trajectory points obtained from simulator are transformed to car inner coordinate system as all computations
+are performed in this coordinate system. Transformation is based on current car state which is obtained from simulator as 
+well `./src/main.cpp`, lines `109-117`. 3rd degree polynomial curve is used to fit trajectory points. This curve used as a
+base trajectory car should drive as close as possible to (fitting in `./src/main.cpp`, line `120`). During lesson it was said 
+that 3rd degree polynomial curves are enough to approximate most type of the roads. This curve is later used as an input to
+optimization problem.
+
+### 2. Kinematic model.
+
+The following kinematic model (to be orecise its update equations) for car movement is used in this project:
+```c
+x[t+1] = x[t] + v[t] * cos(psi[t]) * dt;
+y[t+1] = y[t] + v[t] * sin(psi[t]) * dt;
+psi[t+1] = psi[t] + v[t] / Lf * delta[t] * dt;
+v[t+1] = v[t] + a[t] * dt;
+cte[t+1] = f(x[t]) - y[t] + v[t] * sin(epsi[t]) * dt;
+epsi[t+1] = psi[t] - psides[t] + v[t] * delta[t] / Lf * dt;
+```
+
+where `[x,y, psi, v, cte, epsi]` is the state of a car (`x` and `y` are car's coordinate, `psi` is a car's orientation,
+`v` is a car's speed, `cte` is a car cross-track error relative to reference trajectory and `epsi` is an orientaion error
+to reference trajectory), `a` and `delta` are control values (`a` is car throttle and `delta` is a steering angle), `f(x)` is
+an `y` coordinate of a reference trajectory for a given `x` coordinate, `psides` is a tangencial angle of a reference trajectory,
+`Lf` is a distance between front of car and its center of gravity (it is a predefined constant for this project).
+
+### 3. Dealing with latency.
+
+There is two approaches to deal with latency that immediately come to mind. First is to use optimization procedure. Optimization
+procedure produces `N-1` pairs of control values (where `N` is a number of timesteps). We use the first pair of control values
+which help us to move car from state at time `t` to state at time `t+1` (or to be more precise `t + dt` where `dt` is length of
+timestep). Instead we can use `n`-th pair of control values, where `n` is the pair of control values used to move car from state 
+`t + delay` to `t + delay + dt`, where `delay` is equals to latency. Second approach is to use a kinematic model to predict at
+what state car will be at time `t + delay` given a car state a time `t` and then use standard optimization (as it is in a system 
+without delay) to move car to state at time `t + delay + dt`. It is important to mention that kinematic model update step is described
+in car inner coordinate system, so it will look like:
+
+```c
+x1 = 0. + v * cos(0) * dt;
+y1 = 0. + v * sin(0) * dt;
+psi1 = 0. - v * steer_value * dt / Lf;
+v1 = v + throttle_value * dt;
+cte1 = cte + v * sin(epsi) * dt;
+epsi1 = epsi - v * steer_value * dt / Lf;
+```
+
+Dealing with latency can be found at `./src/main.cpp`, lines `125-131`.
+
+### 4. Optimization procedure horizon.
+
+In these sections parameter tuning for solver will be described. First of all is prediction
+horizon. It consists of two variables `N` and `dt`, where `N` is a number of prediction
+steps and `dt` is a length of prediction step. So in ideal world the prediction procedure
+should take car from state at moment `t` to state at moment `t + N * dt`. But we actually
+use only first pair of produced control values so it will take car to state at time `t + dt` only.
+And on the next step a new iteration of optimization procedure will be performed to state at time `t + dt`.
+I tried various `N` in span of `[6, 20]` but ended with `N = 10`. I noticed that there was no significant
+difference in car behaviour between `N = 10` and `N = 20` cases so I decided to avoid unnecessary computations
+and chose `N = 10`. I tried to further decrease `N` to `8` and then `6` but I noticed that it was much harder
+to chose correct cost function as curves produced by optimization procedure bacame really unstable at times
+so I decided to return to `N = 10`. As for `dt` I ended with `dt = 0.1`. I started with `dt = 0.5` as it was in
+lesson's example but I realized that it was not efficient to look to far in the future as we tend to approximate
+given reference curve not so great near our car's current position which was crucial to MPC approach so I moved
+to `dt = 0.1` and was able to get decent results. I decided against further decreasing `dt` as in my opinion
+the approximation of reference curve was of enough quality already. So I ended up with `N = 10` and `dt = 0.1` and
+prediction horizon `N * dt` of `1` second.
+
+### 5. Optimization procedure constraints.
+
+For all state variables constraints are chosen in `[-1.0e19, 1.0e19]` interval, so state variables can be almost
+anything despite some unreasonably small or big values. Constraints for steering angle is `[-25., 25.]` degrees and
+for throttle is `[-1., 1.]` which is exactly all possible values accepted by simulator. These constraints can be
+found at `./src/MPC.cpp`, lines `179-197`.
+
+### 6. Optimization procedure cost function.
+
+Cost function is the heart of optimization procedure and is constructed to minimize the following parameters across 
+all `N` optimization epochs:
+
+```c
+    // The part of the cost based on the reference state.
+    for (size_t t = 0; t < N; t++) {
+      fg[0] += 1000 * CppAD::pow(vars[cte_start + t], 2);
+      fg[0] += 1000 * CppAD::pow(vars[epsi_start + t], 2);
+      fg[0] += CppAD::pow(vars[v_start + t] - ref_v, 2);
+    }
+
+    // Minimize the use of actuators.
+    for (size_t t = 0; t < N - 1; t++) {
+      fg[0] += 100 * CppAD::pow(vars[delta_start + t], 2);
+      fg[0] += 10 * CppAD::pow(vars[a_start + t], 2);
+    }
+
+    // Minimize the value gap between sequential actuations.
+    for (size_t t = 0; t < N - 2; t++) {
+      fg[0] += 1000000 * CppAD::pow(vars[delta_start + t + 1] - vars[delta_start + t], 2);
+      fg[0] += 100 * CppAD::pow(vars[a_start + t + 1] - vars[a_start + t], 2);
+    }
+
+```
+
+Function is constructed as a sum of squared parameters. First group corresponds to state parameters.
+First two corresponds to minimization cross-track and orientation errors, third actually to make sure
+that moving speed is not deviating much from reference speed (`50` mph in our case). This third parameter
+is introduced to make sure that car optimal movement will be actually movement across reference curve and not
+stopping at a point on the map. Second group of parameters is chosen to minimize usage of controll values,
+the less control should be used to keep car on the reference curve the better. It ensures that car is moving 
+in a relatively smooth way across the track. Third group of parameters is chosen to ensure that control values
+are applied in a smooth way, and not differs much from epoch to epoch. This is an approach to make sure that control
+is applied in a predictable way. Which is crucial as we only use the first pair of control values. Coefficients
+before the summands are used to tune cost function and determine what parameters are more important then the others.
+As it can be seen above tne most crucial parameter is difference between adjacent steering angles. During tuning
+procees I found out that it was the most important parameter that was preventing car movement trajectory from divergence.
+As it can be seen minimization of cross-track and orientation errors is important as well. The least important is
+speed related parameters as in fact it is only needed to make sure that car is moving with something close to predefined 
+speed. It is worth to mention that in the end throttle related parameters ended up to be less important than steering angle
+related which is of no surprise as steering is the key to keep car on the track. Cost function implementation can be found 
+at `./src/MPC.cpp`, lines `49-68`.
+
 ## Dependencies
 
 * cmake >= 3.5
